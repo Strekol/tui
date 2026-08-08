@@ -696,6 +696,69 @@ def split_worktree(cwd: str | None) -> tuple[str | None, str | None]:
     return cwd, None
 
 
+def git_worktree(cwd: str | None) -> tuple[str | None, str | None]:
+    """Worktree git ORDINAIRE : (racine du dépôt principal, nom du worktree).
+
+    Rien à voir avec le layout Claude (`<projet>/.claude/worktrees/<nom>`, cf.
+    `split_worktree`) : un `git worktree add` pose son checkout n'importe où, et
+    ce cwd n'a alors aucun marqueur dans son chemin. La preuve est sur le disque
+    — la racine d'un worktree porte un `.git` FICHIER (et non un dossier) qui
+    pointe vers `<dépôt>/.git/worktrees/<nom>`. Un `.git` dossier = checkout
+    principal, on s'arrête. Un `gitdir:` sans `/worktrees/` = sous-module.
+
+    Purement pour l'AFFICHAGE : Claude range le transcript d'un worktree git
+    ordinaire sous le slug de son PROPRE cwd, donc `cwd_to_project_dir` ne doit
+    surtout pas remonter à la racine ici. Hors worktree → (None, None).
+    """
+    if not cwd:
+        return None, None
+    start = Path(cwd)
+    for d in (start, *start.parents):
+        dot = d / '.git'
+        try:
+            if dot.is_dir():
+                return None, None
+            if not dot.is_file():
+                continue
+            head = dot.read_text(errors='ignore')[:4096].strip()
+        except OSError:
+            return None, None
+        if not head.startswith('gitdir:'):
+            return None, None
+        gitdir = head[len('gitdir:'):].strip().split('\n', 1)[0]
+        # `worktree.useRelativePaths` écrit un gitdir RELATIF au dossier du
+        # worktree ; le résoudre garde la racine du dépôt exploitable.
+        target = Path(gitdir) if Path(gitdir).is_absolute() else (d / gitdir)
+        parts = target.parts
+        try:
+            i = len(parts) - 1 - parts[::-1].index('worktrees')
+        except ValueError:
+            return None, None
+        # <dépôt>/.git/worktrees/<nom> : la racine est ce qui précède le '.git'.
+        if i < 2 or parts[i - 1] != '.git' or i + 1 >= len(parts):
+            return None, None
+        return str(Path(*parts[:i - 1])), parts[i + 1]
+    return None, None
+
+
+def worktree_of(cwd: str | None, transcript_found: bool) -> tuple[str | None, str | None]:
+    """(projet à AFFICHER, nom du worktree) — sinon (cwd, None).
+
+    Worktree Claude : le marqueur est dans le chemin, donc potentiellement
+    fortuit ; on ne le retient que si le transcript a bien été résolu sous la
+    racine parente. Worktree git ordinaire : le `.git` fichier EST la preuve,
+    aucune confirmation à chercher.
+    """
+    root, name = split_worktree(cwd)
+    if name is not None and transcript_found:
+        return root, name
+    # Marqueur Claude non confirmé : on ne s'arrête pas là. Un worktree Claude
+    # EST un worktree git, et son `.git` fichier prouve ce que le chemin ne fait
+    # que suggérer.
+    root, name = git_worktree(cwd)
+    return (root, name) if name else (cwd, None)
+
+
 def cwd_to_project_dir(cwd: str | None, config_dir: str | None = None) -> Path | None:
     if not cwd:
         return None
@@ -1305,12 +1368,12 @@ def scan_local_sessions() -> list[dict]:
         config_dir = resolve_config_dir(env)
         state, context_pct, tool, topic, last_activity, session_id = get_session_state(
             pid, cwd, p['starttime'], config_dir)
-        # Worktree « confirmé » = marqueur détecté ET transcript résolu
-        # (last_activity = mtime du JSONL trouvé). On affiche alors le VRAI projet
-        # (racine parente) + une sous-ligne « ↳ WT: <nom> ». Non confirmé →
+        # Worktree Claude « confirmé » (marqueur détecté ET transcript résolu) ou
+        # worktree git ordinaire (prouvé par son `.git` fichier) : on affiche le
+        # VRAI projet (racine du dépôt) + une sous-ligne « ↳ WT: <nom> ». Sinon
         # comportement inchangé (chemin brut, pas de sous-ligne).
-        wt_root, wt_name = split_worktree(cwd)
-        confirmed_wt = wt_name is not None and last_activity is not None
+        wt_root, wt_name = worktree_of(cwd, last_activity is not None)
+        confirmed_wt = wt_name is not None
         sessions.append({
             'pid':             pid,
             'starttime':       p['starttime'],
