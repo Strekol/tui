@@ -267,10 +267,9 @@ def _row(**kw):
 
 
 @pytest.mark.parametrize('state, expected', [
-    ('waiting',    {'waiting': True,  'working': False, 'background': False}),
-    ('working',    {'waiting': False, 'working': True,  'background': False}),
-    ('background', {'waiting': False, 'working': False, 'background': True}),
-    ('idle',       {'waiting': False, 'working': False, 'background': False}),
+    ('waiting', {'waiting': True,  'working': False, 'bg_shell': False}),
+    ('working', {'waiting': False, 'working': True,  'bg_shell': False}),
+    ('idle',    {'waiting': False, 'working': False, 'bg_shell': False}),
 ])
 def test_state_maps_to_booleans(watcher, state, expected):
     s = watcher.adapt_remote_row(_row(state=state), REMOTE, 1000.0)
@@ -278,17 +277,31 @@ def test_state_maps_to_booleans(watcher, state, expected):
         assert s[k] is v
 
 
+def test_a_background_shell_is_a_marker_not_a_state(watcher):
+    """L'état ne dit que la disponibilité de Claude ; le shell de fond voyage à
+    part, sinon une session au prompt se lit « occupée »."""
+    s = watcher.adapt_remote_row(_row(state='idle', bg_shell=True), REMOTE, 1000.0)
+    assert (s['waiting'], s['working'], s['bg_shell']) == (False, False, True)
+
+
+def test_the_legacy_background_state_is_translated_not_dropped(watcher):
+    """Serveur d'avant `bg_shell` : son 'background' voulait dire « inactive, mais
+    un shell tourne ». Un client à jour lit des hôtes qui ne le sont pas."""
+    s = watcher.adapt_remote_row(_row(state='background'), REMOTE, 1000.0)
+    assert (s['waiting'], s['working'], s['bg_shell']) == (False, False, True)
+
+
 def test_daemon_row_is_marked_and_never_active(watcher):
     s = watcher.adapt_remote_row(_row(state='daemon', daemon=True, idle_seconds=None),
                                  REMOTE, 1000.0)
     assert s['daemon'] is True
-    assert (s['waiting'], s['working'], s['background']) == (False, False, False)
+    assert (s['waiting'], s['working'], s['bg_shell']) == (False, False, False)
     assert s['last_activity'] is None
 
 
 def test_unknown_state_degrades_to_idle(watcher):
     s = watcher.adapt_remote_row(_row(state='teleporting'), REMOTE, 1000.0)
-    assert (s['waiting'], s['working'], s['background']) == (False, False, False)
+    assert (s['waiting'], s['working'], s['bg_shell']) == (False, False, False)
 
 
 def test_remote_row_carries_the_caller_supplied_label(watcher):
@@ -610,7 +623,7 @@ def test_local_scan_runs_by_default(watcher, monkeypatch):
     monkeypatch.setattr(watcher.CFG, 'no_local', False, raising=False)
     monkeypatch.setattr(watcher, 'scan_local_sessions',
                         lambda: [dict(_row(pid=5), waiting=False, working=False,
-                                      background=False, project='local')])
+                                      bg_shell=False, project='local')])
     assert [s['pid'] for s in watcher.scan_sessions(None)] == [5]
 
 
@@ -1031,7 +1044,7 @@ def test_print_once_survives_a_scheme_less_remote(watcher, monkeypatch, capsys):
     monkeypatch.setattr(watcher.CFG, 'idle_format', 'none', raising=False)
     monkeypatch.setattr(watcher, 'scan_local_sessions',
                         lambda: [dict(_row(pid=5), waiting=False, working=False,
-                                      background=False, project='local', worktree=None,
+                                      bg_shell=False, project='local', worktree=None,
                                       topic=None, agents=[], config_dir=None,
                                       last_activity=None, context_pct=None, tool=None,
                                       daemon=False, display_cwd='/home/u/local')])
@@ -1539,3 +1552,12 @@ def test_main_refuses_to_start_on_a_broken_enabled_value(watcher, monkeypatch, c
     with pytest.raises(SystemExit) as e:
         watcher.main()
     assert 'enabled' in str(e.value)
+
+
+def test_the_tooltip_spells_out_the_background_shell_marker(watcher):
+    """Le marqueur de ligne est un glyphe : sans l'infobulle, rien ne dit ce
+    qu'il veut dire."""
+    s = watcher.adapt_remote_row(_row(state='idle', bg_shell=True), REMOTE, 1000.0)
+    assert watcher.BG_SHELL_GLYPH in watcher.session_tooltip(s)
+    plain = watcher.adapt_remote_row(_row(state='idle'), REMOTE, 1000.0)
+    assert watcher.BG_SHELL_GLYPH not in watcher.session_tooltip(plain)

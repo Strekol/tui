@@ -291,7 +291,9 @@ STRINGS = {
         'title':      'CLAUDE CODE WATCHER',
         'waiting':    'attente',
         'working':    'travaille',
-        'background': 'en fond',
+        'waiting_s':  'att',
+        'working_s':  'trav',
+        'bg_shell':   'shell de fond',
         'idle':       'idle',
         'no_session': 'aucune session active',
         'attend':     'attend',
@@ -305,9 +307,6 @@ STRINGS = {
         'col_proj':   'projet',
         'col_meta':   'pid · durée',
         'col_ctx':    'ctx',
-        'count':      '{w} en attente · {p} en cours · ',
-        'count_bg':   '{b} en fond · ',
-        'count_total':'{t} total',
         'about':         'À propos',
         'close':         'Fermer',
         'copy':          'Copier la commande',
@@ -378,7 +377,9 @@ STRINGS = {
         'title':      'CLAUDE CODE WATCHER',
         'waiting':    'waiting',
         'working':    'working',
-        'background': 'background',
+        'waiting_s':  'wait',
+        'working_s':  'work',
+        'bg_shell':   'background shell',
         'idle':       'idle',
         'no_session': 'no active session',
         'attend':     'waiting',
@@ -392,9 +393,6 @@ STRINGS = {
         'col_proj':   'project',
         'col_meta':   'pid · elapsed',
         'col_ctx':    'ctx',
-        'count':      '{w} waiting · {p} working · ',
-        'count_bg':   '{b} background · ',
-        'count_total':'{t} total',
         'about':         'About',
         'close':         'Close',
         'copy':          'Copy command',
@@ -473,7 +471,8 @@ COLOR_TITLE   = "#cc8a2e"
 COLOR_WAITING = "#e86c3a"
 COLOR_WORKING = "#d4a052"
 COLOR_IDLE    = "#4caf7d"
-COLOR_BACKGROUND = "#5c8a9e"   # muted teal — un shell/tâche de fond tourne, Claude a rendu la main
+BG_SHELL_GLYPH = '⚙'         # marqueur « un shell de fond tourne »
+COLOR_BACKGROUND = "#5c8a9e"   # muted teal — couleur du marqueur ⚙ : un shell de fond tourne
 COLOR_CLAUDE  = "#cc785c"   # Claude brand orange — marque les instances CLAUDE_CONFIG_DIR custom
 COLOR_REMOTE  = "#7a9ec2"   # bleu sourd — préfixe « <label>: » des lignes distantes
 TEXT_DIM2     = "#888898"
@@ -1136,10 +1135,13 @@ def kill_session(s: dict) -> bool:
 def get_session_state(pid: int, cwd: str | None,
                       starttime: int = 0,
                       config_dir: str | None = None,
-                      ) -> tuple[str, int | None, str | None, str | None, float | None, str | None]:
+                      ) -> tuple[str, int | None, str | None, str | None, float | None, str | None, bool]:
     """État de la session. Retourne (state, context_pct, tool, topic,
-    last_activity, session_id) — session_id sert à rattacher les subagents
-    (--parent-session-id) à leur session ; None si le registre est absent.
+    last_activity, session_id, bg_shell) — session_id sert à rattacher les
+    subagents (--parent-session-id) à leur session, None si le registre est
+    absent ; bg_shell dit qu'un shell de fond a survécu au tour. L'état ne décrit
+    QUE la disponibilité de Claude : un shell de fond est un détail SUR la
+    session, pas ce qu'elle est.
 
     Le registre ~/.claude/sessions/<pid>.json (champ `status`) est prioritaire
     quand il existe ; selon la version de Claude Code il peut être absent,
@@ -1149,6 +1151,7 @@ def get_session_state(pid: int, cwd: str | None,
     """
     reg = get_session_registry(pid, starttime, config_dir)
     session_id = reg.get('sessionId') if reg else None
+    bg_shell = False
     # Le slug du transcript se calcule sur le cwd de DÉMARRAGE de la session, que
     # le registre enregistre. Le cwd /proc dérive dès que le dossier est renommé
     # ou que l'utilisateur fait un `cd` en cours de session — le slugifier
@@ -1194,11 +1197,9 @@ def get_session_state(pid: int, cwd: str | None,
         # ne tourne, le statut est resté collé (sous-agents interrompus, session
         # mise en fond) — annoncer 'background' inventait un travail inexistant,
         # on prend l'état du JSONL, seule information vraie qui reste.
-        if jsonl_state in ('waiting', 'idle'):
-            if status == 'shell':
-                state = 'background'
-            elif status == 'busy':
-                state = jsonl_state
+        if status in ('shell', 'busy') and jsonl_state in ('waiting', 'idle'):
+            state = jsonl_state
+            bg_shell = status == 'shell'
         # Idle-since : instant EXACT du dernier changement d'état du registre
         # (ms epoch). Prioritaire sur le mtime du JSONL, qui bouge pour des
         # écritures de fond (résumés, todos) sans refléter l'inactivité réelle.
@@ -1211,7 +1212,7 @@ def get_session_state(pid: int, cwd: str | None,
                 pass
     else:
         state = jsonl_state or 'idle'
-    return state, context_pct, tool, topic, last_activity, session_id
+    return state, context_pct, tool, topic, last_activity, session_id, bg_shell
 
 
 def format_elapsed(s) -> str:
@@ -1336,7 +1337,7 @@ def scan_local_sessions() -> list[dict]:
                 'elapsed':         p['elapsed'],
                 'waiting':         False,
                 'working':         False,
-                'background':      False,
+                'bg_shell':        False,
                 'context_pct':     None,
                 'tool':            None,
                 'terminal_pid':    None,
@@ -1366,7 +1367,7 @@ def scan_local_sessions() -> list[dict]:
             window_id = find_best_window(term_pid, cwd, all_windows)
 
         config_dir = resolve_config_dir(env)
-        state, context_pct, tool, topic, last_activity, session_id = get_session_state(
+        state, context_pct, tool, topic, last_activity, session_id, bg_shell = get_session_state(
             pid, cwd, p['starttime'], config_dir)
         # Worktree Claude « confirmé » (marqueur détecté ET transcript résolu) ou
         # worktree git ordinaire (prouvé par son `.git` fichier) : on affiche le
@@ -1388,7 +1389,7 @@ def scan_local_sessions() -> list[dict]:
             'elapsed':         p['elapsed'],
             'waiting':         state == 'waiting',
             'working':         state == 'working',
-            'background':      state == 'background',
+            'bg_shell':        bg_shell,
             'context_pct':     context_pct,
             'tool':            tool,
             'terminal_pid':    term_pid,
@@ -1429,15 +1430,14 @@ def scan_sessions(remote_rows: list[dict] | None = None) -> list[dict]:
         def _sort_key(s: dict) -> tuple:
             if s['waiting']:      bucket = 0
             elif s['working']:    bucket = 1
-            elif s['background']: bucket = 2
-            else:                 bucket = 3
+            else:                 bucket = 2
             la = s.get('last_activity')
-            idle = ((now - la) if la is not None else float('inf')) if bucket == 3 else 0.0
+            idle = ((now - la) if la is not None else float('inf')) if bucket == 2 else 0.0
             return (bucket, idle, s['project'].lower())
         sessions.sort(key=_sort_key)
     else:
         sessions.sort(key=lambda s: (
-            not s['waiting'], not s['working'], not s['background'], s['project'].lower()))
+            not s['waiting'], not s['working'], s['project'].lower()))
     return sessions
 
 
@@ -1450,8 +1450,6 @@ def session_state_label(s: dict) -> tuple[str, str]:
         return COLOR_WAITING, tr('attend')
     if s['working']:
         return COLOR_WORKING, tr('working')
-    if s['background']:
-        return COLOR_BACKGROUND, tr('background')
     return COLOR_IDLE, tr('idle')
 
 
@@ -1795,7 +1793,14 @@ def adapt_remote_row(row: object, remote: dict, received_at: float,
     if pid is None:
         return None
     state = row.get('state')
-    if state not in ('waiting', 'working', 'background', 'idle', 'daemon'):
+    bg_shell = row.get('bg_shell') is True
+    # Serveur d'avant `bg_shell` : son 'background' VOULAIT dire « inactive, mais
+    # un shell de fond tourne ». On le traduit au lieu de le jeter — un client à
+    # jour lit des hôtes qui ne le sont pas encore, et perdre le signal en
+    # silence serait pire qu'une ligne de traduction.
+    if state == 'background':
+        state, bg_shell = 'idle', True
+    if state not in ('waiting', 'working', 'idle', 'daemon'):
         state = 'idle'
     idle = _as_float(row.get('idle_seconds'))
     last_activity = remote_last_activity(idle, received_at, age_seconds)
@@ -1816,7 +1821,7 @@ def adapt_remote_row(row: object, remote: dict, received_at: float,
         'elapsed':         min(REMOTE_MAX_ELAPSED_S, max(0, _as_int(row.get('elapsed')) or 0)),
         'waiting':         state == 'waiting',
         'working':         state == 'working',
-        'background':      state == 'background',
+        'bg_shell':        bg_shell,
         'context_pct':     min(100, max(0, pct)) if pct is not None else None,
         'tool':            clean_remote_str(row.get('tool'), 40),
         # Rien de local ne doit pouvoir être visé depuis une ligne distante.
@@ -2039,6 +2044,59 @@ def local_config_dirs(sessions: list[dict]) -> list[str]:
             if s.get('config_dir') and not s.get('remote')]
 
 
+# Trois niveaux de rédaction des compteurs, du plus riche au plus dense. On MESURE
+# avant de poser, au lieu de poser puis de constater l'ellipse : `is_ellipsized()`
+# n'est vrai qu'après allocation, donc y réagir crée une boucle de relayout à
+# borner. Niveau 2 en chiffres nus séparés par '/' et non en emoji : la plupart
+# des terminaux rendent un emoji sur DEUX cellules, ce qui fausserait la mesure
+# côté TUI.
+def counts_segments(waiting: int, working: int, bg_shell: int, total: int,
+                    level: int) -> list[tuple[str, str]]:
+    """Segments (texte, couleur) de la zone de compteurs, pour un niveau donné.
+
+    Un compteur à zéro n'est jamais écrit : « 0 attente » occupe la place qui
+    manque justement. Le séparateur est l'affaire de l'appelant.
+    """
+    seg: list[tuple[str, str]] = []
+    if level >= 2:
+        if waiting:  seg.append((str(waiting), COLOR_WAITING))
+        if working:  seg.append((str(working), COLOR_WORKING))
+        if bg_shell: seg.append((f'{bg_shell}{BG_SHELL_GLYPH}', COLOR_BACKGROUND))
+        seg.append((str(total), TEXT_DIM2))
+        return seg
+    if level == 1:
+        if waiting:  seg.append((f"{waiting} {tr('waiting_s')}", COLOR_WAITING))
+        if working:  seg.append((f"{working} {tr('working_s')}", COLOR_WORKING))
+        if bg_shell: seg.append((f'{bg_shell}{BG_SHELL_GLYPH}', COLOR_BACKGROUND))
+        seg.append((str(total), TEXT_DIM2))
+        return seg
+    if waiting:  seg.append((f"{waiting} {tr('waiting')}", COLOR_WAITING))
+    if working:  seg.append((f"{working} {tr('working')}", COLOR_WORKING))
+    if bg_shell: seg.append((f'{bg_shell} {BG_SHELL_GLYPH}', COLOR_BACKGROUND))
+    seg.append((f"{total} total", TEXT_DIM2))
+    return seg
+
+
+def counts_sep(level: int) -> str:
+    """Séparateur des compteurs : '/' au niveau le plus dense, ' · ' sinon."""
+    return '/' if level >= 2 else ' · '
+
+
+def fit_level(measure, budget: int, levels: int = 3) -> int:
+    """Premier niveau (0 = le plus riche) dont le rendu tient dans `budget`.
+
+    `measure(level) -> largeur`, dans l'unité de l'appelant (pixels côté GTK,
+    cellules côté TUI). Budget nul ou négatif (label pas encore alloué) → niveau
+    le plus riche : on ne dégrade pas sur une mesure qu'on n'a pas.
+    """
+    if budget <= 0:
+        return 0
+    for lvl in range(levels):
+        if measure(lvl) <= budget:
+            return lvl
+    return levels - 1
+
+
 def remotes_bar_text(remotes: list[dict], stat: dict[str, dict],
                      poll_s: float, now: float) -> str:
     """Contenu de la zone d'état : un fragment par remote CONFIGURÉ, session ou pas."""
@@ -2112,6 +2170,10 @@ def session_tooltip(s: dict, rstate: dict | None = None) -> str:
             tip = f"{tip}\n{stale}"
     if s.get('daemon'):
         return f"{tip}\n\n{tr('tip_daemon')}"
+    if s.get('bg_shell'):
+        # Le marqueur de ligne est un glyphe ; l'infobulle est le seul endroit qui
+        # dit ce qu'il signifie.
+        tip = f"{tip}\n\n{BG_SHELL_GLYPH} {tr('bg_shell')}"
     topic = (s.get('topic') or '').strip()
     if topic:
         tip = f'{tip}\n\nTopic: {topic}'
@@ -2259,6 +2321,7 @@ class RemotePoller:
 
 # ── TUI (Textual) ───────────────────────────────────────────────────────────────
 
+from rich.cells import cell_len  # noqa: E402
 from rich.text import Text  # noqa: E402
 
 from textual.app import App, ComposeResult  # noqa: E402
@@ -2642,7 +2705,10 @@ class WatcherApp(App):
         overflow-x: hidden;
     }
     DataTable > .datatable--cursor { background: #2a2a33; }
-    #counts { color: #888898; padding: 0 1; }
+    /* width explicite : la mesure des compteurs (fit_level) prend cette largeur
+       pour budget ; laissée en auto, elle suivrait le texte posé et le niveau
+       le plus dense se verrouillerait — cf. le même piège côté GTK. */
+    #counts { color: #888898; padding: 0 1; width: 1fr; }
     #remotes { color: #7a9ec2; padding: 0 1; }
     """
 
@@ -2813,7 +2879,7 @@ class WatcherApp(App):
 
         # On construit toutes les lignes EN MÉMOIRE d'abord, pour décider ensuite
         # entre mise à jour en place et reconstruction (cf. signature plus bas).
-        waiting = working = background = 0
+        waiting = working = bg_shell = 0
         target_row = 0
         row_tips: dict[str, Text] = {}  # str(pid) → infobulle (chemin + sujet complets)
         built: list[tuple[str, Text, Text, int]] = []  # (clé, cellule gauche, droite, hauteur)
@@ -2823,8 +2889,8 @@ class WatcherApp(App):
                 waiting += 1
             elif s['working']:
                 working += 1
-            elif s['background']:
-                background += 1
+            if s['bg_shell']:
+                bg_shell += 1
 
             daemon = s.get('daemon')
             # Cellule gauche : ● + chemin (ligne 1), pid · durée en sourdine (ligne 2).
@@ -2853,7 +2919,7 @@ class WatcherApp(App):
             idle_fmt = getattr(CFG, 'idle_format', 'none')
             la = s.get('last_activity')
             if idle_fmt != 'none' and la is not None \
-                    and not s['working'] and not s['waiting'] and not s['background']:
+                    and not s['working'] and not s['waiting']:
                 sess.append(f" · idle {format_idle(now - la, idle_fmt)}", style=TEXT_DIM2)
             cfg = display_config_dir(s.get('config_dir'))
             if cfg:
@@ -2884,10 +2950,18 @@ class WatcherApp(App):
             st = Text(justify="right", no_wrap=True)
             st.append(badge, style=color)
             right_lines = 1
-            if agents:
-                n = len(agents)
-                st.append(f"\n{n} {tr('agents') if n > 1 else tr('agent')}",
-                          style=COLOR_CLAUDE)
+            # Sous-ligne de DÉTAILS : sous-agents et shell de fond y cohabitent.
+            # Le marqueur n'est pas collé au badge, qui doit rester court — la
+            # ligne d'état est déjà en concurrence de largeur avec le chemin.
+            if agents or s['bg_shell']:
+                st.append("\n")
+                if agents:
+                    n = len(agents)
+                    st.append(f"{n} {tr('agents') if n > 1 else tr('agent')}",
+                              style=COLOR_CLAUDE)
+                if s['bg_shell']:
+                    st.append((' ' if agents else '') + f'{BG_SHELL_GLYPH} sh',
+                              style=COLOR_BACKGROUND)
                 right_lines += 1
             pct  = s.get('context_pct')
             tool = s.get('tool')
@@ -2955,13 +3029,21 @@ class WatcherApp(App):
                 table.move_cursor(row=min(target_row, table.row_count - 1), scroll=False)
                 self.call_after_refresh(table.scroll_to, None, prior_scroll_y, animate=False)
 
-        # Ordre : waiting · working · [background ·] total — aligné sur le header GTK.
-        # Le fragment background n'apparaît que s'il y a au moins une session en fond.
-        bg_frag = tr('count_bg').format(b=background) if background else ''
-        self.query_one("#counts", Static).update(
-            tr('count').format(w=waiting, p=working)
-            + bg_frag + tr('count_total').format(t=len(sessions))
-        )
+        # Même rédaction que l'en-tête GTK, et même repli : on MESURE les trois
+        # niveaux et on pose le plus riche qui tient dans la largeur allouée,
+        # plutôt que d'en poser un et de le laisser tronquer.
+        counts = self.query_one("#counts", Static)
+        args = (waiting, working, bg_shell, len(sessions))
+        level = fit_level(
+            lambda lvl: cell_len(counts_sep(lvl).join(
+                t for t, _ in counts_segments(*args, lvl))),
+            counts.size.width)
+        line = Text(no_wrap=True, overflow="ellipsis")
+        for i, (txt, colour) in enumerate(counts_segments(*args, level)):
+            if i:
+                line.append(counts_sep(level), style=TEXT_DIM2)
+            line.append(txt, style=colour)
+        counts.update(line)
 
         # Zone d'état des remotes : TOUS les remotes configurés y figurent, même
         # sans session. Un remote qui n'a JAMAIS répondu (URL fausse, token
@@ -3166,7 +3248,7 @@ def print_once(remotes: list[dict] | None = None) -> None:
         la = s.get('last_activity')
         idle = (f" · idle {format_idle(time.time() - la, idle_fmt)}"
                 if idle_fmt != 'none' and la is not None
-                and not s['working'] and not s['waiting'] and not s['background'] else "")
+                and not s['working'] and not s['waiting'] else "")
         topic = (s.get('topic') or '').strip().split('\n', 1)[0]
         top = f" · {topic}" if topic else ""
         agents = s.get('agents') or []

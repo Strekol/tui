@@ -15,6 +15,8 @@ A terminal UI (Textual) that monitors all running Claude Code sessions on your m
   - **Waiting** (orange) — Claude replied, waiting for your input
   - **Working** (amber) — Claude is processing your message, with tool name
   - **Idle** (green) — session paused
+- A `⚙ sh` marker beside the badge when a background shell outlived the turn
+  (`!cmd`, a backgrounded Bash, a Monitor) — Claude is available, something still runs
 - Context window usage (`ctx%`) shown when available
 - Spawned **subagent count** per session (`N agents`), with each agent detailed in the row tooltip — toggle off in Settings
 - Background **daemon** shown as a non-focusable `(D)` row (hideable in Settings)
