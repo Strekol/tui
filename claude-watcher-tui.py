@@ -696,6 +696,69 @@ def split_worktree(cwd: str | None) -> tuple[str | None, str | None]:
     return cwd, None
 
 
+def git_worktree(cwd: str | None) -> tuple[str | None, str | None]:
+    """Worktree git ORDINAIRE : (racine du dépôt principal, nom du worktree).
+
+    Rien à voir avec le layout Claude (`<projet>/.claude/worktrees/<nom>`, cf.
+    `split_worktree`) : un `git worktree add` pose son checkout n'importe où, et
+    ce cwd n'a alors aucun marqueur dans son chemin. La preuve est sur le disque
+    — la racine d'un worktree porte un `.git` FICHIER (et non un dossier) qui
+    pointe vers `<dépôt>/.git/worktrees/<nom>`. Un `.git` dossier = checkout
+    principal, on s'arrête. Un `gitdir:` sans `/worktrees/` = sous-module.
+
+    Purement pour l'AFFICHAGE : Claude range le transcript d'un worktree git
+    ordinaire sous le slug de son PROPRE cwd, donc `cwd_to_project_dir` ne doit
+    surtout pas remonter à la racine ici. Hors worktree → (None, None).
+    """
+    if not cwd:
+        return None, None
+    start = Path(cwd)
+    for d in (start, *start.parents):
+        dot = d / '.git'
+        try:
+            if dot.is_dir():
+                return None, None
+            if not dot.is_file():
+                continue
+            head = dot.read_text(errors='ignore')[:4096].strip()
+        except OSError:
+            return None, None
+        if not head.startswith('gitdir:'):
+            return None, None
+        gitdir = head[len('gitdir:'):].strip().split('\n', 1)[0]
+        # `worktree.useRelativePaths` écrit un gitdir RELATIF au dossier du
+        # worktree ; le résoudre garde la racine du dépôt exploitable.
+        target = Path(gitdir) if Path(gitdir).is_absolute() else (d / gitdir)
+        parts = target.parts
+        try:
+            i = len(parts) - 1 - parts[::-1].index('worktrees')
+        except ValueError:
+            return None, None
+        # <dépôt>/.git/worktrees/<nom> : la racine est ce qui précède le '.git'.
+        if i < 2 or parts[i - 1] != '.git' or i + 1 >= len(parts):
+            return None, None
+        return str(Path(*parts[:i - 1])), parts[i + 1]
+    return None, None
+
+
+def worktree_of(cwd: str | None, transcript_found: bool) -> tuple[str | None, str | None]:
+    """(projet à AFFICHER, nom du worktree) — sinon (cwd, None).
+
+    Worktree Claude : le marqueur est dans le chemin, donc potentiellement
+    fortuit ; on ne le retient que si le transcript a bien été résolu sous la
+    racine parente. Worktree git ordinaire : le `.git` fichier EST la preuve,
+    aucune confirmation à chercher.
+    """
+    root, name = split_worktree(cwd)
+    if name is not None and transcript_found:
+        return root, name
+    # Marqueur Claude non confirmé : on ne s'arrête pas là. Un worktree Claude
+    # EST un worktree git, et son `.git` fichier prouve ce que le chemin ne fait
+    # que suggérer.
+    root, name = git_worktree(cwd)
+    return (root, name) if name else (cwd, None)
+
+
 def cwd_to_project_dir(cwd: str | None, config_dir: str | None = None) -> Path | None:
     if not cwd:
         return None
@@ -841,6 +904,14 @@ def _read_topic(path: Path) -> tuple[str | None, str | None]:
     return title, last_prompt
 
 
+# Sous-types d'évènement `system` qui marquent une FIN DE TOUR — les seuls qui
+# prouvent que Claude a rendu la main. Les autres (`informational`, `api_error`,
+# `local_command`, `compact_boundary`…) surviennent EN COURS de tour : les lire
+# comme un tour terminé faisait dégrader en 'background' une session qui
+# travaillait (registre 'busy' recoupé avec un JSONL cru inactif).
+_TURN_END_SUBTYPES = {'turn_duration', 'stop_hook_summary', 'away_summary'}
+
+
 def _parse_session_lines(lines: list[str]) -> tuple[str | None, int | None, str | None]:
     """Parse bottom-up : (state, context_pct, tool).
 
@@ -871,7 +942,7 @@ def _parse_session_lines(lines: list[str]) -> tuple[str | None, int | None, str 
                 state = 'working' if sr in (None, 'tool_use', 'pause_turn') else 'waiting'
             elif kind == 'user':
                 state = 'working'
-            elif kind == 'system':
+            elif kind == 'system' and ev.get('subtype') in _TURN_END_SUBTYPES:
                 state = 'idle'
         if kind == 'assistant':
             msg = ev.get('message', {})
@@ -897,6 +968,47 @@ def _parse_session_lines(lines: list[str]) -> tuple[str | None, int | None, str 
     return state, context_pct, tool
 
 
+# Un sessionId sert à CONSTRUIRE des chemins (chemin direct et motif glob) : sans
+# garde, un id piégé dans le registre lit hors de l'arbre des projets
+# ('../../ailleurs/secret') ou rouvre le bug du voisin en jouant le joker ('*').
+# On exige UN SEUL composant de nom de fichier, sans '..' — et pas une forme
+# d'UUID : le jour où Claude change de format d'identifiant, une garde trop
+# étroite ferait disparaître ctx/sujet de TOUTES les lignes, en silence.
+_SID_RE = re.compile(r'(?!\.\.?\Z)[A-Za-z0-9._-]+\Z')
+
+
+# (racine projets, session_id) → chemin du JSONL, quand il n'est pas sous le slug
+# du cwd (session reprise depuis un autre dossier). Évite de re-scanner tous les
+# projets à chaque rafraîchissement. La racine fait partie de la clé : deux
+# CLAUDE_CONFIG_DIR peuvent porter le même sessionId.
+_SID_PATH_CACHE: dict[tuple[str, str], Path | None] = {}
+
+
+def _find_transcript(session_id: str, project_dir: Path) -> Path | None:
+    """JSONL de la session : sous le slug du cwd, sinon scan des autres projets."""
+    if not _SID_RE.match(session_id):
+        return None
+    cand = project_dir / f'{session_id}.jsonl'
+    if cand.is_file():
+        return cand
+    root = project_dir.parent
+    key = (str(root), session_id)
+    if key in _SID_PATH_CACHE:
+        hit = _SID_PATH_CACHE[key]
+        # Absence mémorisée (None) : sûr UNIQUEMENT parce que le chemin direct
+        # ci-dessus est testé avant, à chaque appel — un transcript qui apparaît
+        # plus tard sous le slug du cwd est donc toujours vu.
+        if hit is None or hit.is_file():
+            return hit
+    if len(_SID_PATH_CACHE) > 200:
+        _SID_PATH_CACHE.clear()
+    for p in root.glob(f'*/{session_id}.jsonl'):
+        _SID_PATH_CACHE[key] = p
+        return p
+    _SID_PATH_CACHE[key] = None
+    return None
+
+
 def get_session_info_from_jsonl(
     cwd: str | None,
     config_dir: str | None = None,
@@ -908,19 +1020,24 @@ def get_session_info_from_jsonl(
     fallback (registre absent) ; `topic` = titre IA, sinon dernier prompt ;
     `mtime` = dernière activité (proxy « inactif depuis »), None si introuvable.
     Si `session_id`
-    est fourni, cible directement <session_id>.jsonl (chemin exact, aucun
-    devinage) ; sinon le .jsonl le plus récent du projet. Court-circuit par mtime
+    est fourni, cible <session_id>.jsonl (sous le slug du cwd, sinon dans le
+    projet où il vit réellement) et rien d'autre ; sinon le .jsonl le plus
+    récent du projet. Court-circuit par mtime
     + lecture du seul tail (relecture complète si besoin).
     """
     project_dir = cwd_to_project_dir(cwd, config_dir)
     if not project_dir:
         return None, None, None, None, None
-    latest = None
     if session_id:
-        cand = project_dir / f'{session_id}.jsonl'
-        if cand.is_file():
-            latest = cand
-    if latest is None:
+        # Le transcript ne vit pas forcément sous le slug du cwd : une session
+        # reprise (`claude -r <id>`) depuis un autre dossier garde son JSONL
+        # d'origine. Retomber ici sur « le .jsonl le plus récent du projet »
+        # lirait l'état d'une session VOISINE et l'attribuerait à celle-ci
+        # (statut, ctx%, sujet). Mieux vaut rien que faux : pas de repli.
+        latest = _find_transcript(session_id, project_dir)
+        if latest is None:
+            return None, None, None, None, None
+    else:
         jsonl_files = [f for f in project_dir.glob('*.jsonl') if f.is_file()]
         if not jsonl_files:
             return None, None, None, None, None
@@ -1073,8 +1190,15 @@ def get_session_state(pid: int, cwd: str | None,
         # condition est fausse, aucune réconciliation. 'compacting' est
         # volontairement EXCLU (vrai travail de fond, bref). jsonl_state vaut None
         # si le JSONL est introuvable : la condition est fausse, on garde 'working'.
-        if status in ('shell', 'busy') and jsonl_state in ('waiting', 'idle'):
-            state = 'background'
+        # 'shell' : un shell de fond tourne VRAIMENT → 'background'. 'busy' : rien
+        # ne tourne, le statut est resté collé (sous-agents interrompus, session
+        # mise en fond) — annoncer 'background' inventait un travail inexistant,
+        # on prend l'état du JSONL, seule information vraie qui reste.
+        if jsonl_state in ('waiting', 'idle'):
+            if status == 'shell':
+                state = 'background'
+            elif status == 'busy':
+                state = jsonl_state
         # Idle-since : instant EXACT du dernier changement d'état du registre
         # (ms epoch). Prioritaire sur le mtime du JSONL, qui bouge pour des
         # écritures de fond (résumés, todos) sans refléter l'inactivité réelle.
@@ -1244,12 +1368,12 @@ def scan_local_sessions() -> list[dict]:
         config_dir = resolve_config_dir(env)
         state, context_pct, tool, topic, last_activity, session_id = get_session_state(
             pid, cwd, p['starttime'], config_dir)
-        # Worktree « confirmé » = marqueur détecté ET transcript résolu
-        # (last_activity = mtime du JSONL trouvé). On affiche alors le VRAI projet
-        # (racine parente) + une sous-ligne « ↳ WT: <nom> ». Non confirmé →
+        # Worktree Claude « confirmé » (marqueur détecté ET transcript résolu) ou
+        # worktree git ordinaire (prouvé par son `.git` fichier) : on affiche le
+        # VRAI projet (racine du dépôt) + une sous-ligne « ↳ WT: <nom> ». Sinon
         # comportement inchangé (chemin brut, pas de sous-ligne).
-        wt_root, wt_name = split_worktree(cwd)
-        confirmed_wt = wt_name is not None and last_activity is not None
+        wt_root, wt_name = worktree_of(cwd, last_activity is not None)
+        confirmed_wt = wt_name is not None
         sessions.append({
             'pid':             pid,
             'starttime':       p['starttime'],
