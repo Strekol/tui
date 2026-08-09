@@ -41,20 +41,31 @@ jobs:
       # deux dépôts), branche par défaut sinon. Corollaire, et c'est une
       # CONTRAINTE D'ORDONNANCEMENT, pas un défaut : une modification du cœur
       # n'est verte ici qu'une fois sa jumelle poussée sur le dépôt GTK.
-      - name: Checkout the GTK widget (shared remote core, matching branch)
-        id: gtk_branch
-        continue-on-error: true
-        uses: actions/checkout@v4
-        with:
-          repository: claude-watcher/gtk
-          ref: ${{ github.head_ref || github.ref_name }}
-          path: _gtk
+      #
+      # La révision est RÉSOLUE D'ABORD, puis extraite UNE FOIS. La forme
+      # précédente — tenter la branche en continue-on-error, puis un repli —
+      # cassait dès que la branche jumelle était fusionnée et supprimée : la
+      # tentative ratée laissait `_gtk` en NON-dépôt, et le repli mourait sur
+      # `git reset --hard HEAD`, si bien que le garde de parité comparait un
+      # module vide et déclarait tous les symboles partagés manquants.
+      - name: Resolve the GTK widget revision
+        id: sibling
+        run: |
+          set -euo pipefail
+          branch="${{ github.head_ref || github.ref_name }}"
+          ref=""
+          if git ls-remote --exit-code --heads \
+               "https://github.com/claude-watcher/gtk.git" "$branch" >/dev/null 2>&1; then
+            ref="$branch"
+          fi
+          echo "gtk=${ref:-<branche par défaut>}"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the GTK widget (default branch fallback)
-        if: steps.gtk_branch.outcome == 'failure'
+      - name: Checkout the GTK widget (shared core)
         uses: actions/checkout@v4
         with:
           repository: claude-watcher/gtk
+          ref: ${{ steps.sibling.outputs.ref }}
           path: _gtk
 
       - name: Install uv
