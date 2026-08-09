@@ -15,6 +15,8 @@ Une interface terminal (Textual) qui surveille toutes les sessions Claude Code a
   - **Attente** (orange) — Claude a répondu, attend votre saisie
   - **Travaille** (amber) — Claude traite votre message, avec le nom de l'outil
   - **Idle** (vert) — session en pause
+- Marqueur `⚙ sh` à côté du badge quand un shell de fond a survécu au tour
+  (`!cmd`, Bash en fond, Monitor) — Claude est dispo, quelque chose tourne encore
 - Utilisation du contexte (`ctx%`) affichée si disponible
 - Nombre de **sous-agents** lancés par session (`N agents`), chacun détaillé dans l'infobulle de la ligne — désactivable dans les Réglages
 - **Démon** de fond affiché en ligne `(D)` non-focusable (masquable dans les Réglages)
