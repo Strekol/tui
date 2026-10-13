@@ -1135,6 +1135,7 @@ def kill_session(s: dict) -> bool:
 def get_session_state(pid: int, cwd: str | None,
                       starttime: int = 0,
                       config_dir: str | None = None,
+                      since: float | None = None,
                       ) -> tuple[str, int | None, str | None, str | None, float | None, str | None, bool]:
     """État de la session. Retourne (state, context_pct, tool, topic,
     last_activity, session_id, bg_shell) — session_id sert à rattacher les
@@ -1148,6 +1149,9 @@ def get_session_state(pid: int, cwd: str | None,
     auquel cas l'état est déduit du JSONL. Le JSONL fournit dans tous les cas le
     % de contexte et le nom de l'outil courant. `sessionId` du registre, quand
     il existe, donne le chemin exact du JSONL ; sinon on devine par slug du cwd.
+
+    `since` (démarrage du process) active la prise en compte des sous-agents
+    in-process : un agent qui tourne rend la session `working` (cf. session_agents).
     """
     reg = get_session_registry(pid, starttime, config_dir)
     session_id = reg.get('sessionId') if reg else None
@@ -1200,6 +1204,16 @@ def get_session_state(pid: int, cwd: str | None,
         if status in ('shell', 'busy') and jsonl_state in ('waiting', 'idle'):
             state = jsonl_state
             bg_shell = status == 'shell'
+            reconciled = True
+        else:
+            reconciled = False
+        # Sous-agent in-process en cours : Claude travaille et reprendra seul à sa
+        # fin (le registre reste d'ailleurs 'busy'). Seul un `waiting` venu du
+        # REGISTRE (permission) prime ; un `waiting` réconcilié depuis le JSONL
+        # n'est qu'une fin de tour.
+        if since is not None and (state == 'idle' or reconciled) \
+                and session_agents(session_id, transcript_cwd, config_dir, since):
+            state = 'working'
         # Idle-since : instant EXACT du dernier changement d'état du registre
         # (ms epoch). Prioritaire sur le mtime du JSONL, qui bouge pour des
         # écritures de fond (résumés, todos) sans refléter l'inactivité réelle.
@@ -1213,6 +1227,131 @@ def get_session_state(pid: int, cwd: str | None,
     else:
         state = jsonl_state or 'idle'
     return state, context_pct, tool, topic, last_activity, session_id, bg_shell
+
+
+# Sous-agents IN-PROCESS (outil Agent) : aucun process à voir dans /proc, leur
+# seule trace est un transcript à part, <transcript sans .jsonl>/subagents/
+# agent-<id>.jsonl, flanqué d'un agent-<id>.meta.json (type, description,
+# modèle). Le registre de la session n'en dit rien : un agent lancé en fond
+# termine le tour, la session lit `idle` alors que Claude travaille encore.
+_AGENT_HANDBACK_TOOL = 'SubagentHandback'
+# Ce que Claude écrit quand un agent est arrêté (TaskStop) ou interrompu.
+_AGENT_INTERRUPTED = '[Request interrupted by user'
+# {dossier subagents: {fichier: (mtime, en cours)}} — remplacé à chaque appel par
+# les seuls fichiers présents : borné par les agents vivants, jamais vidé en bloc.
+_AGENT_CACHE: dict[str, dict[str, tuple[float, bool]]] = {}
+
+
+def _agent_running(lines: list[str]) -> bool | None:
+    """Parse bottom-up d'un transcript de sous-agent : tourne-t-il encore ?
+
+    Fini = dernier message assistant à stop_reason terminal (end_turn…), résultat
+    RÉUSSI de son SubagentHandback (rapport remis à l'appelant), ou marqueur
+    d'interruption (TaskStop). Un handback refusé (`success: false`) ou un message
+    réinjecté après (l'agent reprend sur la notification d'une de ses propres
+    tâches de fond) → il tourne. None : aucun message dans les lignes lues.
+    """
+    handback_id = None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        kind = ev.get('type')
+        msg = ev.get('message') or {}
+        content = msg.get('content')
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        if kind == 'assistant':
+            if handback_id is not None:
+                return not any(b.get('type') == 'tool_use' and b.get('id') == handback_id
+                               and b.get('name') == _AGENT_HANDBACK_TOOL for b in blocks)
+            return msg.get('stop_reason') in (None, 'tool_use', 'pause_turn')
+        if kind == 'user' and handback_id is None:
+            text = content if isinstance(content, str) else next(
+                (b.get('text') for b in blocks if b.get('type') == 'text'), None)
+            if isinstance(text, str) and text.startswith(_AGENT_INTERRUPTED):
+                return False
+            res = ev.get('toolUseResult')
+            if not (isinstance(res, dict) and res.get('success') is True):
+                return True
+            handback_id = next((b.get('tool_use_id') for b in blocks
+                                if b.get('type') == 'tool_result'), None)
+            if handback_id is None:
+                return True
+    return None
+
+
+def session_agents(session_id: str | None, cwd: str | None,
+                   config_dir: str | None, since: float) -> list[dict]:
+    """Sous-agents in-process EN COURS de la session → [{pid, name, type, model}].
+
+    `since` = démarrage du process claude : un transcript d'agent immobile depuis
+    appartient à une vie antérieure de la session (`claude -r`), tué avec elle
+    sans que sa fin soit écrite — il paraîtrait tourner pour toujours. pid None :
+    l'agent vit dans le process de la session.
+    """
+    project_dir = cwd_to_project_dir(cwd, config_dir)
+    if not session_id or project_dir is None:
+        return []
+    transcript = _find_transcript(session_id, project_dir)
+    if transcript is None:
+        return []
+    sub = str(transcript.with_suffix('') / 'subagents')
+    try:
+        entries = list(os.scandir(sub))
+    except OSError:
+        return []
+    old = _AGENT_CACHE.get(sub, {})
+    fresh: dict[str, tuple[float, bool]] = {}
+    agents: list[dict] = []
+    for e in entries:
+        if not (e.name.startswith('agent-') and e.name.endswith('.jsonl')):
+            continue
+        try:
+            mtime = e.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < since:
+            continue
+        cached = old.get(e.path)
+        if cached and cached[0] == mtime:
+            running = cached[1]
+        else:
+            path = Path(e.path)
+            try:
+                lines, complete = _read_tail_lines(path, _JSONL_TAIL_BYTES)
+                r = _agent_running(lines)
+                if r is None and not complete:
+                    r = _agent_running(path.read_text(errors='ignore').split('\n'))
+                # None après lecture complète : transcript tout juste créé, aucun
+                # message encore → l'agent démarre.
+                running = r is not False
+            except OSError:
+                running = False
+        fresh[e.path] = (mtime, running)
+        if not running:
+            continue
+        try:
+            meta = json.loads(Path(e.path.removesuffix('.jsonl') + '.meta.json').read_text())
+        except (OSError, ValueError):
+            meta = None
+        if not isinstance(meta, dict):
+            meta = {}
+        desc, typ, model = (v if isinstance(v, str) and v else None
+                            for v in (meta.get('description'), meta.get('agentType'), meta.get('model')))
+        agents.append({
+            'pid':   None,
+            'name':  desc or e.name.removeprefix('agent-').removesuffix('.jsonl'),
+            'type':  typ,
+            'model': (model or '').removeprefix('claude-') or None,
+        })
+    if len(_AGENT_CACHE) > 200:
+        _AGENT_CACHE.clear()
+    _AGENT_CACHE[sub] = fresh
+    agents.sort(key=lambda a: a['name'])
+    return agents
 
 
 def format_elapsed(s) -> str:
@@ -1368,7 +1507,10 @@ def scan_local_sessions() -> list[dict]:
 
         config_dir = resolve_config_dir(env)
         state, context_pct, tool, topic, last_activity, session_id, bg_shell = get_session_state(
-            pid, cwd, p['starttime'], config_dir)
+            pid, cwd, p['starttime'], config_dir, since=p['start_unix'])
+        # Liste seule (l'état en tient déjà compte) ; show_agents la masque plus
+        # loin sans toucher à l'état.
+        running_agents = session_agents(session_id, cwd, config_dir, p['start_unix'])
         # Worktree Claude « confirmé » (marqueur détecté ET transcript résolu) ou
         # worktree git ordinaire (prouvé par son `.git` fichier) : on affiche le
         # VRAI projet (racine du dépôt) + une sous-ligne « ↳ WT: <nom> ». Sinon
@@ -1397,7 +1539,7 @@ def scan_local_sessions() -> list[dict]:
             'kitty_socket':    kitty_socket,
             'kitty_window_id': kitty_window_id,
             'config_dir':      config_dir,
-            'agents':          subagents.get(session_id, []) if session_id else [],
+            'agents':          (subagents.get(session_id, []) if session_id else []) + running_agents,
             'daemon':          False,
         })
     return sessions
