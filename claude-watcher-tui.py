@@ -518,6 +518,11 @@ def scan_proc(collect_agents: bool = True) -> tuple[list[dict], dict[str, list[d
 
     comm est lu EN PREMIER : un échec de lecture cmdline ne fait jamais perdre une
     session claude (elle est juste traitée comme non-démon).
+
+    Un 'claude' NON interactif (`-p`/`--print`/`--output-format`/`--input-format`)
+    portant le token argv exact `--no-session-persistence` est ignoré : exécution
+    headless éphémère (ex. génération de titre T3 Code), sans transcript ni rien
+    à surveiller.
     """
     try:
         uptime = float(Path('/proc/uptime').read_text().split()[0])
@@ -550,6 +555,13 @@ def scan_proc(collect_agents: bool = True) -> tuple[list[dict], dict[str, list[d
                 argv = (entry / 'cmdline').read_bytes().decode(errors='ignore').split('\0')
             except OSError:
                 argv = []
+            # Tokens exacts (un substring dans un prompt/JSON ne compte pas) ; le
+            # flag n'agit qu'en mode print, une session interactive persiste.
+            if '--no-session-persistence' in argv and any(
+                    a in ('-p', '--print', '--output-format', '--input-format')
+                    or a.startswith(('--output-format=', '--input-format='))
+                    for a in argv):
+                continue
             procs.append({'pid': int(entry.name), 'elapsed': elapsed,
                           'start_unix': time.time() - elapsed, 'starttime': starttime,
                           'is_daemon': len(argv) > 1 and argv[1] == 'daemon'})
